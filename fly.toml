@@ -2,9 +2,6 @@
 app = "ubt-pair-indexer"
 primary_region = "sin"
 
-[build]
-  dockerfile = "Dockerfile"
-
 [env]
   PORT = "3001"
 
