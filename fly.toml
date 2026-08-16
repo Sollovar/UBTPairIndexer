@@ -1,18 +1,45 @@
-# fly.toml app configuration for UNBOUND pair indexer
-app = "ubt-pair-indexer"
+# fly.toml — ubt-pair-indexer
+# Pair indexer: polls GeckoTerminal and writes pairs to PostgreSQL.
+#
+# Deploy:
+#   fly secrets set DATABASE_URL="postgres://fly-user:PASS@pgbouncer.HOST.flympg.net/fly-db?sslmode=disable" --app ubt-pair-indexer
+#   fly deploy --app ubt-pair-indexer
+#
+# DATABASE_URL is required — set it as a secret, never hardcode here.
+
+app            = "ubt-pair-indexer"
 primary_region = "sin"
 
+[build]
+  dockerfile = "Dockerfile"
+
 [env]
-  PORT = "3001"
+  PORT                    = "3001"
+  NODE_ENV                = "production"
+  MIN_REQUEST_DELAY_MS    = "10000"
+  CHAIN_FETCH_DELAY_MS    = "120000"
+  MAX_BATCH_SIZE          = "1"
+  RETRY_COUNT             = "5"
+  RETRY_BACKOFF_MS        = "5000"
+  SYNC_INTERVAL_SECONDS   = "900"
+
+# DATABASE_URL secret:
+#   fly secrets set DATABASE_URL="postgresql://fly-user:PASSWORD@pgbouncer.3x9jv024zzdr6qp7.flympg.net/fly-db?sslmode=disable" --app ubt-pair-indexer
 
 [[services]]
   internal_port = 3001
-  protocol = "tcp"
+  protocol      = "tcp"
 
   [[services.ports]]
     handlers = ["http"]
-    port = 80
+    port     = 80
 
   [[services.ports]]
     handlers = ["tls", "http"]
-    port = 443
+    port     = 443
+
+  [[services.http_checks]]
+    interval      = "30s"
+    timeout       = "5s"
+    grace_period  = "30s"
+    path          = "/health"
