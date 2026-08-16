@@ -520,6 +520,20 @@ app.post('/api/v1/pairs/sync', handleSyncPairs);
 app.post('/api/pairs/cleanup', handleCleanup);
 app.post('/api/v1/pairs/cleanup', handleCleanup);
 
+// One-time admin endpoint to clear all pairs from DB
+// Usage: POST https://ubtpairindexer.fly.dev/admin/clear-pairs
+app.post('/admin/clear-pairs', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM pairs');
+    pairs.clear();
+    console.log(`[admin] cleared ${result.rowCount} pairs from DB`);
+    res.json({ success: true, deleted: result.rowCount });
+  } catch (err) {
+    console.error('[admin] clear-pairs error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.get('/health', (req, res) => res.json({ status: 'ok', pairs: pairs.size }));
 
 const server = app.listen(PORT, () => {
