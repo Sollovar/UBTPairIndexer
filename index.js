@@ -534,6 +534,33 @@ app.post('/admin/clear-pairs', async (req, res) => {
   }
 });
 
+// One-time migration: add missing columns to pairs table
+app.post('/admin/migrate', async (req, res) => {
+  try {
+    const migrations = [
+      `ALTER TABLE pairs ADD COLUMN IF NOT EXISTS dex_id TEXT`,
+      `ALTER TABLE pairs ADD COLUMN IF NOT EXISTS dex TEXT`,
+      `ALTER TABLE pairs ADD COLUMN IF NOT EXISTS pool_type TEXT`,
+      `ALTER TABLE pairs ADD COLUMN IF NOT EXISTS pool_name TEXT`,
+      `ALTER TABLE pairs ADD COLUMN IF NOT EXISTS market_cap_usd NUMERIC DEFAULT 0`,
+      `ALTER TABLE pairs ADD COLUMN IF NOT EXISTS market_cap NUMERIC DEFAULT 0`,
+      `ALTER TABLE pairs ADD COLUMN IF NOT EXISTS base_token_info JSONB`,
+      `ALTER TABLE pairs ADD COLUMN IF NOT EXISTS quote_token_info JSONB`,
+      `ALTER TABLE pairs ADD COLUMN IF NOT EXISTS indexed_at TIMESTAMPTZ`,
+    ];
+    const results = [];
+    for (const sql of migrations) {
+      await pool.query(sql);
+      results.push(sql);
+    }
+    console.log('[admin] migration complete:', results.length, 'statements');
+    res.json({ success: true, applied: results });
+  } catch (err) {
+    console.error('[admin] migrate error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.get('/health', (req, res) => res.json({ status: 'ok', pairs: pairs.size }));
 
 const server = app.listen(PORT, () => {
