@@ -28,9 +28,9 @@ if (!process.env.DB_PORT && process.env.PGPORT)         process.env.DB_PORT     
 
 // ── Prefer the local Docker database for development testing ────────────────
 if (!process.env.DB_HOST) process.env.DB_HOST = '127.0.0.1';
-if (!process.env.DB_PORT) process.env.DB_PORT = '55432';
+if (!process.env.DB_PORT) process.env.DB_PORT = '55422';
 if (!process.env.DB_USER) process.env.DB_USER = 'postgres';
-if (!process.env.DB_PASSWORD) process.env.DB_PASSWORD = 'Supabase123!';
+if (!process.env.DB_PASSWORD) process.env.DB_PASSWORD = 'postgres';
 if (!process.env.DB_NAME) process.env.DB_NAME = 'postgres';
 
 // ── Mandatory secrets check ───────────────────────────────────────────────────
@@ -79,15 +79,11 @@ const pairs = new Map();
 let orderbookCache = {};
 
 const RATE_LIMIT_CONFIG = {
-  MIN_DELAY_MS: parseInt(process.env.MIN_REQUEST_DELAY_MS) || 20000,
-  CHAIN_FETCH_DELAY_MS: parseInt(process.env.CHAIN_FETCH_DELAY_MS) || 120000,
-  MAX_BATCH_SIZE: parseInt(process.env.MAX_BATCH_SIZE) || 2,
+  MIN_DELAY_MS: parseInt(process.env.MIN_REQUEST_DELAY_MS) || 10000,
+  CHAIN_FETCH_DELAY_MS: parseInt(process.env.CHAIN_FETCH_DELAY_MS) || 10000,
   RETRY_COUNT: parseInt(process.env.RETRY_COUNT) || 5,
   RETRY_BACKOFF_MS: parseInt(process.env.RETRY_BACKOFF_MS) || 5000,
 };
-
-const requestQueue = [];
-let isProcessing = false;
 
 const fetchWithRetry = async (url, retries = RATE_LIMIT_CONFIG.RETRY_COUNT) => {
   for (let i = 0; i < retries; i++) {
@@ -100,8 +96,11 @@ const fetchWithRetry = async (url, retries = RATE_LIMIT_CONFIG.RETRY_COUNT) => {
       });
       if (!response.ok) {
         if (response.status === 429) {
-          const retryAfter = parseInt(response.headers.get('Retry-After') || '30', 10);
-          const waitMs = (Number.isNaN(retryAfter) ? 30000 : retryAfter * 1000) * (i + 1);
+          const retryAfterHeader = parseInt(response.headers.get('Retry-After') || '0', 10);
+          // Never trust Retry-After: 0 — always wait at least 30s on rate limit,
+          // plus exponential backoff per retry attempt.
+          const baseWait = Math.max(retryAfterHeader * 1000, 30000);
+          const waitMs = baseWait * (i + 1);
           console.log(`Rate limited! Waiting ${waitMs / 1000}s before retry ${i + 1}/${retries}...`);
           await new Promise(r => setTimeout(r, waitMs));
           continue;
@@ -123,39 +122,10 @@ const fetchWithRetry = async (url, retries = RATE_LIMIT_CONFIG.RETRY_COUNT) => {
   throw new Error(`Failed to fetch ${url} after ${retries} retries`);
 };
 
-const enqueueRequest = async (fn) => {
-  return new Promise((resolve, reject) => {
-    requestQueue.push({ fn, resolve, reject });
-    if (!isProcessing) processQueue();
-  });
-};
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-const processQueue = async () => {
-  if (isProcessing || requestQueue.length === 0) return;
-  isProcessing = true;
-  while (requestQueue.length > 0) {
-    const batch = requestQueue.splice(0, RATE_LIMIT_CONFIG.MAX_BATCH_SIZE);
-    await Promise.allSettled(batch.map(item => item.fn().then(item.resolve).catch(item.reject)));
-    if (requestQueue.length > 0) {
-      await new Promise(r => setTimeout(r, RATE_LIMIT_CONFIG.MIN_DELAY_MS));
-    }
-  }
-  isProcessing = false;
-};
-
-const getPoolInfo = async (network, poolAddress) => {
-  const url = `${GECKO_API_BASE}/networks/${network}/pools/${poolAddress}/info?include=pool`;
-  return fetchWithRetry(url);
-};
-
-const getTrendingPools = async (network, page = 1, duration = '6h') => {
+const getTrendingPools = async (network, page = 10, duration = '24h') => {
   const url = `${GECKO_API_BASE}/networks/${network}/trending_pools?include=base_token,quote_token&include_gt_community_data=false&page=${page}&duration=${duration}`;
-  return fetchWithRetry(url);
-};
-
-const getPoolDetails = async (network, poolAddresses) => {
-  const addressesParam = poolAddresses.join(',');
-  const url = `${GECKO_API_BASE}/networks/${network}/pools/multi/${addressesParam}?include=base_token,quote_token&include_volume_breakdown=false&include_composition=false`;
   return fetchWithRetry(url);
 };
 
@@ -206,20 +176,6 @@ const extractTokenMetadata = (tokenData, network) => {
 const getTokenAddress = (tokenData, network) =>
   normalizeAddress(tokenData?.attributes?.address || '', network);
 
-const mapPoolInfoTokens = (poolInfoData, baseAddress, quoteAddress, network) => {
-  const result = { base: null, quote: null };
-  if (!poolInfoData?.data || !Array.isArray(poolInfoData.data)) return result;
-  for (const item of poolInfoData.data) {
-    if (!item || item.type !== 'token' || !item.attributes) continue;
-    const address = getTokenAddress(item, network);
-    const tokenMetadata = extractTokenMetadata(item, network);
-    if (!address || !tokenMetadata) continue;
-    if (address === baseAddress) result.base = tokenMetadata;
-    else if (address === quoteAddress) result.quote = tokenMetadata;
-  }
-  return result;
-};
-
 // ─── DB helpers ──────────────────────────────────────────────────────────────
 
 const ensurePairsTable = async () => {
@@ -228,7 +184,9 @@ const ensurePairsTable = async () => {
       id TEXT PRIMARY KEY,
       network TEXT,
       pair_address TEXT,
+      dex_id TEXT,
       dex_name TEXT,
+      pool_type TEXT,
       base_token JSONB,
       quote_token JSONB,
       base_symbol TEXT,
@@ -249,7 +207,9 @@ const ensurePairsTable = async () => {
 
   const alterStatements = [
     "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS pair_address TEXT",
+    "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS dex_id TEXT COMMENT 'GeckoTerminal dex.id: pancakeswap_v2, pancakeswap_v3, pancakeswap_infinity, uniswap_v2, uniswap_v3, etc.'",
     "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS dex_name TEXT",
+    "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS pool_type TEXT COMMENT 'Pool version: v2, v3, v4, infinity, bin'",
     "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS base_token JSONB",
     "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS quote_token JSONB",
     "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS base_symbol TEXT",
@@ -276,22 +236,36 @@ const ensurePairsTable = async () => {
   }
 };
 
+// Map GeckoTerminal dex.id to pool type
+const mapDexIdToPoolType = (dexId) => {
+  if (!dexId) return 'v2'; // Default to V2
+  const id = dexId.toLowerCase();
+  if (id.includes('v3')) return 'v3';
+  if (id.includes('v4')) return 'v4';
+  if (id.includes('infinity')) return 'infinity';
+  if (id.includes('bin') || id.includes('lbamm')) return 'bin';
+  if (id.includes('stable') || id.includes('curve')) return 'stable';
+  return 'v2'; // Default
+};
+
 const savePairsToDB = async (pairsData) => {
   if (!pairsData || pairsData.length === 0) return false;
   try {
     for (const p of pairsData) {
       await pool.query(`
         INSERT INTO pairs (
-          id, network, pair_address, dex_name, base_token, quote_token,
+          id, network, pair_address, dex_id, dex_name, pool_type, base_token, quote_token,
           base_symbol, quote_symbol, dex, pool_address,
           base_token_decimals, quote_token_decimals,
           base_token_info, quote_token_info, pool_name,
           market_cap_usd, market_cap, created_at, indexed_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW())
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW())
         ON CONFLICT (id) DO UPDATE SET
           network = EXCLUDED.network,
           pair_address = EXCLUDED.pair_address,
+          dex_id = EXCLUDED.dex_id,
           dex_name = EXCLUDED.dex_name,
+          pool_type = EXCLUDED.pool_type,
           base_token = EXCLUDED.base_token,
           quote_token = EXCLUDED.quote_token,
           base_symbol = EXCLUDED.base_symbol,
@@ -307,7 +281,7 @@ const savePairsToDB = async (pairsData) => {
           market_cap = EXCLUDED.market_cap,
           indexed_at = NOW()
       `, [
-        p.id, p.network, p.pair_address, p.dex_name,
+        p.id, p.network, p.pair_address, p.dex_id, p.dex_name, p.pool_type,
         p.base_token, p.quote_token,
         p.base_symbol, p.quote_symbol, p.dex, p.pool_address,
         p.base_token_decimals, p.quote_token_decimals,
@@ -329,8 +303,8 @@ const fetchPairsFromDB = async (network) => {
     // Explicitly select columns, EXCLUDING volume_24h and volume_24h_usd
     // Volume must ONLY come from fills calculated by the backend, never from GeckoTerminal
     const selectColumns = `
-      id, network, pair_address, dex_name, base_token, quote_token,
-      base_symbol, quote_symbol, dex, pool_address,
+      id, network, pair_address, dex_id, dex_name, pool_type, dex, base_token, quote_token,
+      base_symbol, quote_symbol, pool_address,
       base_token_decimals, quote_token_decimals,
       base_token_info, quote_token_info, pool_name,
       price, price_usd, price_change_24h, 
@@ -363,95 +337,96 @@ const syncTrendingPairs = async () => {
   for (const network of SUPPORTED_CHAINS) {
     try {
       console.log(`Fetching trending pools from ${network}...`);
-      const trendingData = await getTrendingPools(network, 1, '6h');
+      const trendingData = await getTrendingPools(network);
       if (!trendingData.data || trendingData.data.length === 0) {
         console.log(`No trending pools found for ${network}`);
         continue;
       }
 
-      const poolAddresses = trendingData.data
-        .map(pool => normalizeAddress(pool.attributes.address, network))
-        .slice(0, 20);
+      const pools = trendingData.data.slice(0, 20);
 
-      const multiPoolData = await getPoolDetails(network, poolAddresses);
-      if (!multiPoolData.data) continue;
-
-      const included = multiPoolData.included || [];
-
-      for (const pool of multiPoolData.data) {
-        const attrs = pool.attributes;
-        const relationships = pool.relationships;
-        const baseTokenId = relationships?.base_token?.data?.id;
-        const quoteTokenId = relationships?.quote_token?.data?.id;
-
-        const baseTokenData = findTokenInIncluded(included, baseTokenId);
-        const quoteTokenData = findTokenInIncluded(included, quoteTokenId);
-
-        const normalizedPairAddress = normalizeAddress(attrs.address, network);
-        const pairId = `${network}_${normalizedPairAddress}`;
-        const baseSymbol = baseTokenData?.attributes?.symbol || attrs.name?.split('/')[0]?.trim() || '???';
-        const quoteSymbol = quoteTokenData?.attributes?.symbol || attrs.name?.split('/')[1]?.replace(/\s*\d+(\.\d+)?%?$/, '')?.trim() || '???';
-
-        if ((network === 'bsc' && quoteSymbol.toUpperCase() === 'BNB') ||
-          (network === 'base' && ['ETH', 'MUSD', 'FIETH'].includes(quoteSymbol.toUpperCase()))) {
+      for (const [index, pool] of pools.entries()) {
+        const attrs = pool.attributes || {};
+        const relationships = pool.relationships || {};
+        const normalizedPairAddress = normalizeAddress(attrs.address || '', network);
+        if (!normalizedPairAddress) {
+          console.warn(`Skipping ${network} trending pool with missing address`);
           continue;
         }
 
-        let baseTokenInfo = baseTokenData ? extractTokenMetadata(baseTokenData, network) : null;
-        let quoteTokenInfo = quoteTokenData ? extractTokenMetadata(quoteTokenData, network) : null;
-        let baseTokenDecimals = baseTokenInfo?.decimals || 18;
-        let quoteTokenDecimals = quoteTokenInfo?.decimals || 18;
-        const baseTokenAddress = baseTokenInfo?.address || normalizeAddress(baseTokenData?.attributes?.address, network) || '';
-        const quoteTokenAddress = quoteTokenInfo?.address || normalizeAddress(quoteTokenData?.attributes?.address, network) || '';
+        const pairId = `${network}_${normalizedPairAddress}`;
+        const existingPair = pairs.get(pairId) || {};
+        const [rawBaseSymbol, rawQuoteSymbol] = (attrs.name || existingPair.pool_name || 'UNKNOWN/UNKNOWN').split('/').map(s => s.trim());
+        const baseSymbol = rawBaseSymbol || existingPair.base_symbol || 'UNKNOWN';
+        const quoteSymbol = rawQuoteSymbol || existingPair.quote_symbol || 'UNKNOWN';
+        const dexId = relationships?.dex?.data?.id || attrs.dex_id || existingPair.dex_id || '';
+        const dexName = dexId ? dexId.split('_')[0] : existingPair.dex_name || '';
+        const poolType = dexId ? mapDexIdToPoolType(dexId) : existingPair.pool_type || '';
+        const dex = dexId ? dexId.split('_')[0] : existingPair.dex || '';
 
-        if (baseTokenAddress && quoteTokenAddress) {
-          try {
-            const poolInfoData = await enqueueRequest(() =>
-              getPoolInfo(network, normalizedPairAddress)
-            );
-            const mapped = mapPoolInfoTokens(poolInfoData, baseTokenAddress, quoteTokenAddress, network);
-            if (mapped.base) { baseTokenInfo = mapped.base; baseTokenDecimals = mapped.base.decimals || baseTokenDecimals; }
-            if (mapped.quote) { quoteTokenInfo = mapped.quote; quoteTokenDecimals = mapped.quote.decimals || quoteTokenDecimals; }
-          } catch (err) {
-            console.log(`⚠ Could not fetch pool info for ${pairId}: ${err.message}`);
-          }
-        }
-
-        if (!baseTokenInfo) baseTokenInfo = { address: '', name: baseSymbol, symbol: baseSymbol, decimals: baseTokenDecimals };
-        if (!quoteTokenInfo) quoteTokenInfo = { address: '', name: quoteSymbol, symbol: quoteSymbol, decimals: quoteTokenDecimals };
+        // Extract full token metadata from GeckoTerminal's included array
+        const included = trendingData.included || [];
+        const baseTokenId = relationships?.base_token?.data?.id;
+        const quoteTokenId = relationships?.quote_token?.data?.id;
+        
+        const baseTokenData = findTokenInIncluded(included, baseTokenId);
+        const quoteTokenData = findTokenInIncluded(included, quoteTokenId);
+        
+        const baseTokenMeta = extractTokenMetadata(baseTokenData, network);
+        const quoteTokenMeta = extractTokenMetadata(quoteTokenData, network);
+        
+        // Build base_token with real address and decimals, fallback to existing or defaults
+        const baseToken = baseTokenMeta ? {
+          address: baseTokenMeta.address || existingPair.base_token?.address || '',
+          name: baseTokenMeta.name || baseSymbol,
+          symbol: baseTokenMeta.symbol || baseSymbol,
+          logo: baseTokenMeta.image_thumb || baseTokenMeta.image_url || existingPair.base_token?.logo || '',
+          decimals: baseTokenMeta.decimals || existingPair.base_token?.decimals || 18
+        } : (existingPair.base_token || { address: '', name: baseSymbol, symbol: baseSymbol, logo: '', decimals: 18 });
+        
+        // Build quote_token with real address and decimals
+        const quoteToken = quoteTokenMeta ? {
+          address: quoteTokenMeta.address || existingPair.quote_token?.address || '',
+          name: quoteTokenMeta.name || quoteSymbol,
+          symbol: quoteTokenMeta.symbol || quoteSymbol,
+          logo: quoteTokenMeta.image_thumb || quoteTokenMeta.image_url || existingPair.quote_token?.logo || '',
+          decimals: quoteTokenMeta.decimals || existingPair.quote_token?.decimals || 18
+        } : (existingPair.quote_token || { address: '', name: quoteSymbol, symbol: quoteSymbol, logo: '', decimals: 18 });
 
         pairs.set(pairId, {
           id: pairId,
           network,
           pair_address: normalizedPairAddress,
-          dex_name: attrs.pool_name?.includes('PancakeSwap') ? 'PancakeSwap' :
-            attrs.pool_name?.includes('Uniswap') ? 'Uniswap' :
-            attrs.pool_name?.includes('Aero') ? 'Aero' :
-            attrs.pool_name?.includes('Raydium') ? 'Raydium' :
-            attrs.pool_name?.split(' ')[0] || 'DEX',
-          base_token: { address: baseTokenInfo.address, name: baseTokenInfo.name, symbol: baseTokenInfo.symbol, logo: baseTokenInfo.image_url || baseTokenInfo.image_large || '', decimals: baseTokenInfo.decimals },
-          quote_token: { address: quoteTokenInfo.address, name: quoteTokenInfo.name, symbol: quoteTokenInfo.symbol, logo: quoteTokenInfo.image_url || quoteTokenInfo.image_large || '', decimals: quoteTokenInfo.decimals },
-          base_symbol: baseTokenInfo?.symbol || '',
-          quote_symbol: quoteTokenInfo?.symbol || '',
-          dex: attrs.pool_name?.split(' ')[0] || 'DEX',
+          dex_id: dexId,
+          dex_name: dexName,
+          pool_type: poolType,
+          base_token: baseToken,
+          quote_token: quoteToken,
+          base_symbol: baseToken.symbol,
+          quote_symbol: quoteToken.symbol,
+          dex,
           pool_address: normalizedPairAddress,
-          base_token_decimals: baseTokenDecimals,
-          quote_token_decimals: quoteTokenDecimals,
-          base_token_info: baseTokenInfo,
-          quote_token_info: quoteTokenInfo,
-          pool_name: attrs.pool_name || attrs.name,
-          market_cap_usd: attrs.market_cap_usd || 0,
-          market_cap: Math.floor(attrs.market_cap_usd || 0),
-          created_at: attrs.pool_created_at,
+          base_token_decimals: baseToken.decimals,
+          quote_token_decimals: quoteToken.decimals,
+          base_token_info: baseTokenMeta || existingPair.base_token_info || null,
+          quote_token_info: quoteTokenMeta || existingPair.quote_token_info || null,
+          pool_name: attrs.name || existingPair.pool_name || '',
+          market_cap_usd: existingPair.market_cap_usd || 0,
+          market_cap: existingPair.market_cap || 0,
+          created_at: attrs.pool_created_at || existingPair.created_at || null,
           indexed_at: new Date().toISOString()
         });
         totalSynced++;
+        
+        const baseAddr = baseToken.address ? baseToken.address.substring(0, 8) : 'no-addr';
+        const quoteAddr = quoteToken.address ? quoteToken.address.substring(0, 8) : 'no-addr';
+        console.log(`✓ ${pairId}: ${baseToken.symbol}/${quoteToken.symbol} (base:${baseAddr}.../${baseToken.decimals}d quote:${quoteAddr}.../${quoteToken.decimals}d) dex_id=${dexId || 'unknown'}`);
       }
 
-      console.log(`Synced ${multiPoolData.data.length} pools from ${network}`);
+      console.log(`Synced ${pools.length} pools from ${network}`);
 
       if (network !== SUPPORTED_CHAINS[SUPPORTED_CHAINS.length - 1]) {
-        await new Promise(r => setTimeout(r, RATE_LIMIT_CONFIG.CHAIN_FETCH_DELAY_MS));
+        await sleep(RATE_LIMIT_CONFIG.CHAIN_FETCH_DELAY_MS);
       }
     } catch (error) {
       console.error(`Error syncing ${network}:`, error.message);
@@ -468,8 +443,14 @@ const initializePairs = async () => {
   if (cachedPairs && cachedPairs.length > 0) {
     cachedPairs.forEach(pair => pairs.set(pair.id, pair));
     console.log(`Loaded ${pairs.size} pairs from DB`);
+    // Already have pairs — wait 60s before hitting GeckoTerminal on boot
+    // to avoid immediate rate-limit on fly.io shared egress IPs.
+    console.log('Waiting 60s before first GeckoTerminal sync to avoid rate limits...');
+    await sleep(60000);
   } else {
     console.log('No cached pairs in DB, fetching from GeckoTerminal...');
+    // No pairs yet — small delay before first fetch
+    await sleep(10000);
   }
 
   const count = await syncTrendingPairs();
