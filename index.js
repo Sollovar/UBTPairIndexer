@@ -854,9 +854,35 @@ const syncTrendingPairs = async () => {
         const baseSymbol = rawBaseSymbol || existingPair.base_symbol || 'UNKNOWN';
         const quoteSymbol = rawQuoteSymbol || existingPair.quote_symbol || 'UNKNOWN';
         const dexId = relationships?.dex?.data?.id || attrs.dex_id || existingPair.dex_id || '';
-        const dexName = dexId ? dexId.split('_')[0] : existingPair.dex_name || '';
+        // Map GeckoTerminal dex_id to a human-readable dex_name.
+        // Splitting by '_' and taking [0] loses critical info (e.g. raydium_cp → "raydium"
+        // and raydium_amm → "raydium" are indistinguishable). Use a proper map instead.
+        const dexNameMap = {
+          'raydium_cp':            'Raydium CPMM',
+          'raydium_cpmm':          'Raydium CPMM',
+          'raydium_clmm':          'Raydium CLMM',
+          'raydium_amm':           'Raydium AMM',
+          'raydium':               'Raydium CPMM', // fallback — most "raydium" trending pools are CPMM
+          'orca':                  'Orca Whirlpool',
+          'meteora':               'Meteora DLMM',
+          'meteora_dlmm':          'Meteora DLMM',
+          'meteora_damm':          'Meteora DAMM',
+          'pump_fun_amm':          'Pump.fun AMM',
+          'pump_fun':              'Pump.fun',
+          'pumpswap':              'PumpSwap',
+          'pancakeswap_v2':        'PancakeSwap V2',
+          'pancakeswap_v3':        'PancakeSwap V3',
+          'pancakeswap_infinity':  'PancakeSwap Infinity',
+          'uniswap_v2':            'Uniswap V2',
+          'uniswap_v3':            'Uniswap V3',
+          'uniswap_v4':            'Uniswap V4',
+          'aerodrome_slipstream':  'Aerodrome Slipstream',
+          'aerodrome':             'Aerodrome',
+        };
+        const dexIdLower = dexId.toLowerCase();
+        const dexName = dexNameMap[dexIdLower] || (dexId ? dexId.split('_')[0] : existingPair.dex_name || '');
         const poolType = dexId ? mapDexIdToPoolType(dexId) : existingPair.pool_type || '';
-        const dex = dexId ? dexId.split('_')[0] : existingPair.dex || '';
+        const dex = dexNameMap[dexIdLower] || (dexId ? dexId.split('_')[0] : existingPair.dex || '');
 
         const included = trendingData.included || [];
         const baseTokenId = relationships?.base_token?.data?.id;
@@ -960,6 +986,45 @@ const syncTrendingPairs = async () => {
 
 const initializePairs = async () => {
   await ensurePairsTable();
+
+  // ── One-time migration: fix dex_name for existing rows ───────────────────
+  // Old code split GeckoTerminal dex_id by '_' and took [0], making all
+  // Raydium pools (CPMM and AMM V4) indistinguishable as just "raydium".
+  // Fix known bad values using dex_id as the source of truth.
+  try {
+    const migrationResult = await pool.query(`
+      UPDATE pairs SET dex_name = CASE
+        WHEN dex_id ILIKE 'raydium_cp%'           THEN 'Raydium CPMM'
+        WHEN dex_id ILIKE 'raydium_clmm%'         THEN 'Raydium CLMM'
+        WHEN dex_id ILIKE 'raydium_amm%'          THEN 'Raydium AMM'
+        WHEN dex_id ILIKE 'raydium%' AND dex_name = 'raydium' THEN 'Raydium CPMM'
+        WHEN dex_id ILIKE 'orca%'                 THEN 'Orca Whirlpool'
+        WHEN dex_id ILIKE 'meteora_dlmm%'         THEN 'Meteora DLMM'
+        WHEN dex_id ILIKE 'meteora_damm%'         THEN 'Meteora DAMM'
+        WHEN dex_id ILIKE 'meteora%'              THEN 'Meteora DLMM'
+        WHEN dex_id ILIKE 'pump_fun_amm%'         THEN 'Pump.fun AMM'
+        WHEN dex_id ILIKE 'pump_fun%'             THEN 'Pump.fun'
+        WHEN dex_id ILIKE 'pumpswap%'             THEN 'PumpSwap'
+        WHEN dex_id ILIKE 'pancakeswap_infinity%' THEN 'PancakeSwap Infinity'
+        WHEN dex_id ILIKE 'pancakeswap_v3%'       THEN 'PancakeSwap V3'
+        WHEN dex_id ILIKE 'pancakeswap_v2%'       THEN 'PancakeSwap V2'
+        WHEN dex_id ILIKE 'pancakeswap%'          THEN 'PancakeSwap'
+        WHEN dex_id ILIKE 'uniswap_v4%'           THEN 'Uniswap V4'
+        WHEN dex_id ILIKE 'uniswap_v3%'           THEN 'Uniswap V3'
+        WHEN dex_id ILIKE 'uniswap_v2%'           THEN 'Uniswap V2'
+        WHEN dex_id ILIKE 'uniswap%'              THEN 'Uniswap'
+        WHEN dex_id ILIKE 'aerodrome_slipstream%' THEN 'Aerodrome Slipstream'
+        WHEN dex_id ILIKE 'aerodrome%'            THEN 'Aerodrome'
+        ELSE dex_name
+      END
+      WHERE dex_id IS NOT NULL AND dex_id != ''
+    `);
+    console.log(`[migration] Fixed dex_name for ${migrationResult.rowCount} rows`);
+  } catch (err) {
+    console.warn(`[migration] dex_name fix failed (non-fatal): ${err.message}`);
+  }
+  // ── End migration ─────────────────────────────────────────────────────────
+
   const cachedPairs = await fetchPairsFromDB();
   if (cachedPairs && cachedPairs.length > 0) {
     cachedPairs.forEach(pair => pairs.set(pair.id, pair));
