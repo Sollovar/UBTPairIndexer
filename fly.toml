@@ -22,6 +22,8 @@ primary_region = "sin"
   RETRY_COUNT             = "5"
   RETRY_BACKOFF_MS        = "5000"
   SYNC_INTERVAL_SECONDS   = "900"
+  # Solana RPC for on-chain pool verification (getMultipleAccounts)
+  SOLANA_RPC_ENDPOINT     = "https://api.mainnet-beta.solana.com"
 
 # DATABASE_URL secret:
 #   fly secrets set DATABASE_URL="postgresql://fly-user:PASSWORD@pgbouncer.3x9jv024zzdr6qp7.flympg.net/fly-db?sslmode=disable" --app ubt-pair-indexer

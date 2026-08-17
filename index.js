@@ -328,7 +328,347 @@ const fetchPairsFromDB = async (network) => {
   }
 };
 
-// ─── GeckoTerminal sync ───────────────────────────────────────────────────────
+// ─── On-Chain Verification for Solana Pools ─────────────────────────────────
+// Uses getMultipleAccounts to read raw pool state bytes and extract the true
+// token mint order and decimals directly from the blockchain.
+// GeckoTerminal is trusted ONLY for the pool address and ranking — never for
+// token order or decimals.
+
+const SOLANA_RPC = process.env.SOLANA_RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com';
+
+// Known DEX program IDs — used to detect pool type from account owner
+const DEX_PROGRAMS = {
+  'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK': 'raydium-clmm',
+  'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C': 'raydium-cpmm',
+  '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8': 'raydium-ammv4',
+  'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc':  'orca-whirlpool',
+  'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo': 'meteora-dlmm',
+  'cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG': 'meteora-damm-v2', // Meteora DAMM V2 (cpamdpZC)
+  'Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EkQXCEg': 'meteora-damm',    // Meteora DAMM V1
+  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P': 'pumpswap',
+  'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA': 'pumpfun-amm',   // Pump.fun AMM (trending memecoins)
+  'REALQqNEZQJgNQJFGYXF8zQeNTVfRGdXJUi4RBZfMDQ': 'byreal',         // Byreal DEX
+};
+
+// Pool state byte offsets for each DEX (verified against official program sources)
+const POOL_MINT_OFFSETS = {
+  'raydium-clmm':     { mint0: 73,  mint1: 105 },  // token_mint_0, token_mint_1
+  'raydium-cpmm':     { mint0: 73,  mint1: 105 },  // same layout as CLMM
+  'orca-whirlpool':   { mint0: 101, mint1: 181 },  // token_mint_a, token_mint_b
+  'meteora-dlmm':     { mint0: 169, mint1: 201 },  // token_x_mint, token_y_mint
+  'meteora-damm':     { mint0: 88,  mint1: 120 },  // token_mint_a, token_mint_b (confirmed from Go adapter readTokenMints)
+  'meteora-damm-v2':  { mint0: 88,  mint1: 120 },  // same layout as DAMM
+  'pumpfun-amm':      { mint0: 40,  mint1: 72  },  // base_mint, quote_mint
+  // raydium-ammv4: NO fixed offsets — mints are read from vault token accounts
+  // handled separately in resolveRaydiumAMMV4Mints() below
+};
+
+/**
+ * Calls getMultipleAccounts for a batch of addresses in a single RPC request.
+ * Returns array of { pubkey, data: Buffer | null } objects.
+ */
+async function getMultipleAccountsRaw(addresses) {
+  if (!addresses || addresses.length === 0) return [];
+  try {
+    const resp = await fetch(SOLANA_RPC, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'getMultipleAccounts',
+        params: [addresses, { encoding: 'base64', commitment: 'confirmed' }],
+      }),
+    });
+    const json = await resp.json();
+    if (json.error) {
+      console.warn('[on-chain] getMultipleAccounts RPC error:', json.error.message);
+      return [];
+    }
+    return (json.result?.value || []).map((acct, i) => ({
+      pubkey: addresses[i],
+      owner: acct?.owner || null,
+      data: acct?.data?.[0] ? Buffer.from(acct.data[0], 'base64') : null,
+    }));
+  } catch (err) {
+    console.warn('[on-chain] getMultipleAccounts failed:', err.message);
+    return [];
+  }
+}
+
+/**
+ * Encodes a 32-byte buffer to a base58 Solana address string.
+ */
+function encodeBase58(buf) {
+  const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  if (!buf || buf.length === 0) return '';
+  let n = BigInt('0x' + buf.toString('hex'));
+  if (n === 0n) return '';
+  let encoded = '';
+  while (n > 0n) {
+    const rem = Number(n % 58n);
+    n = n / 58n;
+    encoded = ALPHABET[rem] + encoded;
+  }
+  // Leading zeros
+  for (let i = 0; i < buf.length && buf[i] === 0; i++) {
+    encoded = '1' + encoded;
+  }
+  return encoded;
+}
+
+/**
+ * Reads the mint address at a given byte offset in a pool account buffer.
+ * Returns base58 string or null if the buffer is too short.
+ */
+function readMintAtOffset(data, offset) {
+  if (!data || data.length < offset + 32) return null;
+  return encodeBase58(data.slice(offset, offset + 32));
+}
+
+/**
+ * Reads SPL token mint decimals from a raw mint account buffer.
+ * SPL Mint layout: decimals is at byte 44.
+ */
+function readMintDecimals(data) {
+  if (!data || data.length < 45) return null;
+  return data[44];
+}
+
+/**
+ * Detects the DEX type for a pool account by its owner program ID.
+ */
+function detectDexType(owner) {
+  return DEX_PROGRAMS[owner] || null;
+}
+
+/**
+ * Raydium AMM V4 stores token vault pubkeys (not mints) in the pool state.
+ * We scan for pairs of 32-byte pubkeys, fetch those accounts, and read the
+ * mint from byte 0 of each token account (SPL Token Account layout).
+ * This mirrors the Go resolvePoolTokenMints() approach in parser.go.
+ *
+ * Known candidate offsets for token vault pubkeys in AMM V4 pool state:
+ * AMM V4 OpenOrders / pc_vault_account offsets used in Go: 336, 64, 72, 80, 88...
+ * We try these offsets to find valid token account pubkeys.
+ */
+const AMM_V4_VAULT_OFFSETS = [336, 368, 400, 432, 464, 496, 64, 96, 128, 160, 192, 224, 256, 288, 320];
+
+async function resolveRaydiumAMMV4Mints(poolData) {
+  // Try each candidate offset pair to find token vault accounts
+  for (const offset of AMM_V4_VAULT_OFFSETS) {
+    if (!poolData || poolData.length < offset + 64) continue;
+
+    const vault0Key = poolData.slice(offset, offset + 32);
+    const vault1Key = poolData.slice(offset + 32, offset + 64);
+
+    // Skip all-zero keys
+    if (!vault0Key.some(b => b !== 0) || !vault1Key.some(b => b !== 0)) continue;
+
+    const vault0Addr = encodeBase58(vault0Key);
+    const vault1Addr = encodeBase58(vault1Key);
+
+    // Fetch both vault accounts in one batch
+    const vaultAccounts = await getMultipleAccountsRaw([vault0Addr, vault1Addr]);
+    if (vaultAccounts.length < 2) continue;
+
+    const acc0 = vaultAccounts[0];
+    const acc1 = vaultAccounts[1];
+
+    // SPL Token Account is exactly 165 bytes
+    // mint is at bytes 0–31
+    if (!acc0.data || acc0.data.length !== 165) continue;
+    if (!acc1.data || acc1.data.length !== 165) continue;
+
+    const mint0 = encodeBase58(acc0.data.slice(0, 32));
+    const mint1 = encodeBase58(acc1.data.slice(0, 32));
+
+    if (!mint0 || !mint1) continue;
+
+    console.log(`[on-chain] ✓ raydium-ammv4 vault scan offset=${offset}: mint0=${mint0.slice(0,8)} mint1=${mint1.slice(0,8)}`);
+    return { mint0, mint1 };
+  }
+  return null;
+}
+
+/**
+ * For a batch of Solana pool addresses, fetches raw account data and extracts
+ * the true token0/token1 mints and decimals from the pool state bytes.
+ *
+ * Returns a Map: poolAddress → { mint0, mint1, decimals0, decimals1, dexType }
+ * Only pools with successfully parsed data are included.
+ */
+async function resolvePoolsOnChain(poolAddresses) {
+  const result = new Map();
+  if (!poolAddresses || poolAddresses.length === 0) return result;
+
+  console.log(`[on-chain] Resolving ${poolAddresses.length} Solana pools via getMultipleAccounts...`);
+
+  // Step 1: Fetch pool accounts
+  const poolAccounts = await getMultipleAccountsRaw(poolAddresses);
+
+  // Step 2: Determine DEX type and extract mint addresses
+  const mintAddressesNeeded = new Set();
+  const poolParsed = [];
+  // Raydium AMM V4 pools need vault-based resolution (separate async pass)
+  const ammV4Pending = [];
+
+  for (const acct of poolAccounts) {
+    if (!acct.data) {
+      console.warn(`[on-chain] No data for pool ${acct.pubkey?.slice(0, 8)}...`);
+      continue;
+    }
+
+    const dexType = detectDexType(acct.owner);
+    if (!dexType) {
+      console.warn(`[on-chain] Unknown program owner ${acct.owner?.slice(0, 8)}... for pool ${acct.pubkey?.slice(0, 8)}...`);
+      continue;
+    }
+
+    // Raydium AMM V4: needs vault token account lookup (not fixed offsets)
+    if (dexType === 'raydium-ammv4') {
+      ammV4Pending.push(acct);
+      continue;
+    }
+
+    const offsets = POOL_MINT_OFFSETS[dexType];
+    if (!offsets) {
+      console.log(`[on-chain] ${dexType} — no offset table, skipping ${acct.pubkey?.slice(0, 8)}...`);
+      continue;
+    }
+
+    const mint0 = readMintAtOffset(acct.data, offsets.mint0);
+    const mint1 = readMintAtOffset(acct.data, offsets.mint1);
+
+    if (!mint0 || !mint1) {
+      console.warn(`[on-chain] Could not read mints for ${dexType} pool ${acct.pubkey?.slice(0, 8)}...`);
+      continue;
+    }
+
+    poolParsed.push({ pubkey: acct.pubkey, dexType, mint0, mint1 });
+    mintAddressesNeeded.add(mint0);
+    mintAddressesNeeded.add(mint1);
+
+    console.log(`[on-chain] ✓ ${dexType} ${acct.pubkey?.slice(0, 8)}... mint0=${mint0.slice(0, 8)} mint1=${mint1.slice(0, 8)}`);
+  }
+
+  // Resolve Raydium AMM V4 pools via vault token account lookup
+  if (ammV4Pending.length > 0) {
+    console.log(`[on-chain] Resolving ${ammV4Pending.length} Raydium AMM V4 pool(s) via vault accounts...`);
+    for (const acct of ammV4Pending) {
+      const mints = await resolveRaydiumAMMV4Mints(acct.data);
+      if (mints) {
+        poolParsed.push({ pubkey: acct.pubkey, dexType: 'raydium-ammv4', mint0: mints.mint0, mint1: mints.mint1 });
+        mintAddressesNeeded.add(mints.mint0);
+        mintAddressesNeeded.add(mints.mint1);
+      } else {
+        console.warn(`[on-chain] Could not resolve AMM V4 vaults for ${acct.pubkey?.slice(0, 8)}...`);
+      }
+    }
+  }
+
+  if (poolParsed.length === 0) return result;
+
+  // Step 3: Fetch all needed mint accounts in one batch to get decimals
+  const mintAddresses = [...mintAddressesNeeded];
+  console.log(`[on-chain] Fetching decimals for ${mintAddresses.length} mints...`);
+  const mintAccounts = await getMultipleAccountsRaw(mintAddresses);
+
+  const decimalsMap = new Map();
+  for (const mintAcct of mintAccounts) {
+    if (mintAcct.data) {
+      const dec = readMintDecimals(mintAcct.data);
+      if (dec !== null) {
+        decimalsMap.set(mintAcct.pubkey, dec);
+      }
+    }
+  }
+
+  // Step 4: Assemble results
+  for (const parsed of poolParsed) {
+    const decimals0 = decimalsMap.get(parsed.mint0) ?? null;
+    const decimals1 = decimalsMap.get(parsed.mint1) ?? null;
+
+    result.set(parsed.pubkey, {
+      mint0: parsed.mint0,
+      mint1: parsed.mint1,
+      decimals0,
+      decimals1,
+      dexType: parsed.dexType,
+    });
+  }
+
+  console.log(`[on-chain] Successfully resolved ${result.size}/${poolAddresses.length} pools`);
+  return result;
+}
+
+/**
+ * Given a GeckoTerminal pair object and its on-chain resolution, applies the
+ * on-chain token order and decimals to the baseToken/quoteToken objects.
+ *
+ * GeckoTerminal provides base/quote addresses — we match them to mint0/mint1
+ * to confirm ordering. If they're swapped, we flip them and log it.
+ */
+function applyOnChainData(pair, onChain) {
+  if (!onChain) return pair; // No on-chain data — return unchanged
+
+  const { mint0, mint1, decimals0, decimals1 } = onChain;
+  const gtBase  = (pair.base_token?.address  || '').trim();
+  const gtQuote = (pair.quote_token?.address || '').trim();
+
+  // Determine if GeckoTerminal's base matches mint0 or mint1
+  const gtBaseIsMint0  = gtBase  === mint0;
+  const gtBaseIsMint1  = gtBase  === mint1;
+  const gtQuoteIsMint0 = gtQuote === mint0;
+  const gtQuoteIsMint1 = gtQuote === mint1;
+
+  if (gtBaseIsMint0 && gtQuoteIsMint1) {
+    // Order matches — just update decimals from chain
+    const updated = { ...pair };
+    if (decimals0 !== null) {
+      updated.base_token  = { ...updated.base_token,  decimals: decimals0 };
+      updated.base_token_decimals = decimals0;
+    }
+    if (decimals1 !== null) {
+      updated.quote_token = { ...updated.quote_token, decimals: decimals1 };
+      updated.quote_token_decimals = decimals1;
+    }
+    console.log(`[on-chain] ✓ ${pair.id} order confirmed mint0=base, decimals corrected`);
+    return updated;
+
+  } else if (gtBaseIsMint1 && gtQuoteIsMint0) {
+    // GeckoTerminal has them SWAPPED — flip base/quote
+    const updated = { ...pair };
+    const origBase  = { ...pair.base_token };
+    const origQuote = { ...pair.quote_token };
+
+    // Swap tokens
+    updated.base_token   = { ...origQuote, decimals: decimals1 ?? origQuote.decimals };
+    updated.quote_token  = { ...origBase,  decimals: decimals0 ?? origBase.decimals };
+    updated.base_symbol  = updated.base_token.symbol;
+    updated.quote_symbol = updated.quote_token.symbol;
+    updated.base_token_decimals  = updated.base_token.decimals;
+    updated.quote_token_decimals = updated.quote_token.decimals;
+    updated.pool_name = `${updated.base_symbol}/${updated.quote_symbol}`;
+    console.log(`[on-chain] ⚠ ${pair.id} SWAPPED GeckoTerminal order: ${origBase.symbol}→quote, ${origQuote.symbol}→base`);
+    return updated;
+
+  } else {
+    // Addresses from GeckoTerminal don't match either mint — GT token addresses
+    // are completely wrong for this pool. Use on-chain mints as authoritative
+    // addresses, keep GT's symbol/name/logo since those are usually correct.
+    // mint0 = base, mint1 = quote (on-chain canonical order).
+    console.warn(`[on-chain] ⚠ ${pair.id} GT addresses mismatch — overriding with on-chain mints: base=${mint0.slice(0,8)} quote=${mint1.slice(0,8)}`);
+    const updated = { ...pair };
+    updated.base_token  = { ...updated.base_token,  address: mint0, decimals: decimals0 ?? updated.base_token.decimals };
+    updated.quote_token = { ...updated.quote_token, address: mint1, decimals: decimals1 ?? updated.quote_token.decimals };
+    updated.base_token_decimals  = updated.base_token.decimals;
+    updated.quote_token_decimals = updated.quote_token.decimals;
+    return updated;
+  }
+}
+
+// ─── End On-Chain Verification ───────────────────────────────────────────────
 
 const syncTrendingPairs = async () => {
   console.log('Starting GeckoTerminal sync...');
@@ -345,7 +685,9 @@ const syncTrendingPairs = async () => {
 
       const pools = trendingData.data.slice(0, 20);
 
-      for (const [index, pool] of pools.entries()) {
+      // ── Build raw pairs from GeckoTerminal data ──────────────────────────
+      const rawPairs = [];
+      for (const pool of pools) {
         const attrs = pool.attributes || {};
         const relationships = pool.relationships || {};
         const normalizedPairAddress = normalizeAddress(attrs.address || '', network);
@@ -364,18 +706,14 @@ const syncTrendingPairs = async () => {
         const poolType = dexId ? mapDexIdToPoolType(dexId) : existingPair.pool_type || '';
         const dex = dexId ? dexId.split('_')[0] : existingPair.dex || '';
 
-        // Extract full token metadata from GeckoTerminal's included array
         const included = trendingData.included || [];
         const baseTokenId = relationships?.base_token?.data?.id;
         const quoteTokenId = relationships?.quote_token?.data?.id;
-        
         const baseTokenData = findTokenInIncluded(included, baseTokenId);
         const quoteTokenData = findTokenInIncluded(included, quoteTokenId);
-        
-        const baseTokenMeta = extractTokenMetadata(baseTokenData, network);
+        const baseTokenMeta  = extractTokenMetadata(baseTokenData,  network);
         const quoteTokenMeta = extractTokenMetadata(quoteTokenData, network);
-        
-        // Build base_token with real address and decimals, fallback to existing or defaults
+
         const baseToken = baseTokenMeta ? {
           address: baseTokenMeta.address || existingPair.base_token?.address || '',
           name: baseTokenMeta.name || baseSymbol,
@@ -383,8 +721,7 @@ const syncTrendingPairs = async () => {
           logo: baseTokenMeta.image_thumb || baseTokenMeta.image_url || existingPair.base_token?.logo || '',
           decimals: baseTokenMeta.decimals || existingPair.base_token?.decimals || 18
         } : (existingPair.base_token || { address: '', name: baseSymbol, symbol: baseSymbol, logo: '', decimals: 18 });
-        
-        // Build quote_token with real address and decimals
+
         const quoteToken = quoteTokenMeta ? {
           address: quoteTokenMeta.address || existingPair.quote_token?.address || '',
           name: quoteTokenMeta.name || quoteSymbol,
@@ -393,7 +730,7 @@ const syncTrendingPairs = async () => {
           decimals: quoteTokenMeta.decimals || existingPair.quote_token?.decimals || 18
         } : (existingPair.quote_token || { address: '', name: quoteSymbol, symbol: quoteSymbol, logo: '', decimals: 18 });
 
-        pairs.set(pairId, {
+        rawPairs.push({
           id: pairId,
           network,
           pair_address: normalizedPairAddress,
@@ -416,14 +753,35 @@ const syncTrendingPairs = async () => {
           created_at: attrs.pool_created_at || existingPair.created_at || null,
           indexed_at: new Date().toISOString()
         });
-        totalSynced++;
-        
-        const baseAddr = baseToken.address ? baseToken.address.substring(0, 8) : 'no-addr';
-        const quoteAddr = quoteToken.address ? quoteToken.address.substring(0, 8) : 'no-addr';
-        console.log(`✓ ${pairId}: ${baseToken.symbol}/${quoteToken.symbol} (base:${baseAddr}.../${baseToken.decimals}d quote:${quoteAddr}.../${quoteToken.decimals}d) dex_id=${dexId || 'unknown'}`);
       }
 
-      console.log(`Synced ${pools.length} pools from ${network}`);
+      // ── On-Chain Verification for Solana pools ───────────────────────────
+      // Batch-fetch pool accounts via getMultipleAccounts, parse raw bytes to
+      // get the true mint0/mint1 order and on-chain decimals. GeckoTerminal's
+      // token ordering is untrusted — only used for address, symbol, logo.
+      let verifiedPairs = rawPairs;
+      if (network === 'solana' && rawPairs.length > 0) {
+        const solanaAddresses = rawPairs.map(p => p.pool_address);
+        const onChainData = await resolvePoolsOnChain(solanaAddresses);
+        if (onChainData.size > 0) {
+          verifiedPairs = rawPairs.map(pair => {
+            const resolved = onChainData.get(pair.pool_address);
+            return resolved ? applyOnChainData(pair, resolved) : pair;
+          });
+          console.log(`[on-chain] Applied verified data to ${onChainData.size}/${rawPairs.length} Solana pools`);
+        }
+      }
+
+      // ── Store verified pairs ─────────────────────────────────────────────
+      for (const pair of verifiedPairs) {
+        pairs.set(pair.id, pair);
+        totalSynced++;
+        const baseAddr  = pair.base_token?.address  ? pair.base_token.address.substring(0, 8)  : 'no-addr';
+        const quoteAddr = pair.quote_token?.address ? pair.quote_token.address.substring(0, 8) : 'no-addr';
+        console.log(`✓ ${pair.id}: ${pair.base_token?.symbol}/${pair.quote_token?.symbol} (base:${baseAddr}.../${pair.base_token_decimals}d quote:${quoteAddr}.../${pair.quote_token_decimals}d) dex_id=${pair.dex_id || 'unknown'}`);
+      }
+
+      console.log(`Synced ${verifiedPairs.length} pools from ${network}`);
 
       if (network !== SUPPORTED_CHAINS[SUPPORTED_CHAINS.length - 1]) {
         await sleep(RATE_LIMIT_CONFIG.CHAIN_FETCH_DELAY_MS);
