@@ -670,6 +670,158 @@ function applyOnChainData(pair, onChain) {
 
 // ─── End On-Chain Verification ───────────────────────────────────────────────
 
+// ─── EVM On-Chain Token Order Verification ───────────────────────────────────
+// For Base and BSC pools, GeckoTerminal's base/quote order is not reliable.
+// We call token0() and token1() on-chain for each pool to get the authoritative
+// token order, then correct the DB entry if GeckoTerminal had them swapped.
+//
+// EVM RPC endpoints — one per chain
+const EVM_RPC = {
+  base: process.env.RPC_ENDPOINT_BASE || 'https://mainnet.base.org',
+  bsc:  process.env.RPC_ENDPOINT_BSC  || 'https://bsc-dataseed.nariox.org/',
+};
+
+// ABI-encoded call data for token0() → keccak256("token0()")[0:4] = 0x0dfe1681
+// ABI-encoded call data for token1() → keccak256("token1()")[0:4] = 0xd21220a7
+// ABI-encoded call data for decimals() → keccak256("decimals()")[0:4] = 0x313ce567
+const TOKEN0_CALLDATA  = '0x0dfe1681';
+const TOKEN1_CALLDATA  = '0xd21220a7';
+const DECIMALS_CALLDATA = '0x313ce567';
+
+async function evmEthCall(rpcUrl, to, data) {
+  try {
+    const resp = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1,
+        method: 'eth_call',
+        params: [{ to, data }, 'latest'],
+      }),
+    });
+    const json = await resp.json();
+    if (json.error || !json.result || json.result === '0x') return null;
+    return json.result;
+  } catch {
+    return null;
+  }
+}
+
+// Decode a 32-byte ABI-padded address result → lowercase hex address
+function decodeEvmAddress(hexResult) {
+  if (!hexResult || hexResult.length < 66) return null;
+  // result is 0x + 32 bytes (64 hex chars), address is in the last 20 bytes (40 chars)
+  return '0x' + hexResult.slice(-40).toLowerCase();
+}
+
+// Decode a uint256 decimals result → integer
+function decodeEvmUint8(hexResult) {
+  if (!hexResult || hexResult === '0x') return null;
+  return parseInt(hexResult, 16);
+}
+
+/**
+ * For a batch of EVM pool addresses on a given network, calls token0()/token1()
+ * and decimals() on-chain to get authoritative token order and decimals.
+ *
+ * Returns Map: poolAddress (lowercase) → { token0, token1, decimals0, decimals1 }
+ */
+async function resolveEVMPoolsOnChain(network, poolAddresses) {
+  const rpcUrl = EVM_RPC[network];
+  if (!rpcUrl || !poolAddresses || poolAddresses.length === 0) return new Map();
+
+  const result = new Map();
+  console.log(`[evm-on-chain] Resolving ${poolAddresses.length} ${network} pools...`);
+
+  for (const poolAddr of poolAddresses) {
+    const addr = poolAddr.toLowerCase();
+    const [t0raw, t1raw] = await Promise.all([
+      evmEthCall(rpcUrl, addr, TOKEN0_CALLDATA),
+      evmEthCall(rpcUrl, addr, TOKEN1_CALLDATA),
+    ]);
+    const token0 = decodeEvmAddress(t0raw);
+    const token1 = decodeEvmAddress(t1raw);
+    if (!token0 || !token1) {
+      console.warn(`[evm-on-chain] Could not read token0/token1 for ${addr.slice(0, 10)}...`);
+      continue;
+    }
+
+    // Fetch decimals for both tokens
+    const [d0raw, d1raw] = await Promise.all([
+      evmEthCall(rpcUrl, token0, DECIMALS_CALLDATA),
+      evmEthCall(rpcUrl, token1, DECIMALS_CALLDATA),
+    ]);
+    const decimals0 = decodeEvmUint8(d0raw);
+    const decimals1 = decodeEvmUint8(d1raw);
+
+    result.set(addr, { token0, token1, decimals0, decimals1 });
+    console.log(`[evm-on-chain] ✓ ${addr.slice(0, 10)}... token0=${token0.slice(0, 10)} token1=${token1.slice(0, 10)}`);
+  }
+
+  console.log(`[evm-on-chain] Resolved ${result.size}/${poolAddresses.length} ${network} pools`);
+  return result;
+}
+
+/**
+ * Applies EVM on-chain token0/token1 order to a pair object.
+ * token0 is the authoritative "base" token (lower address, by EVM convention).
+ * If GeckoTerminal had them swapped, we flip base/quote and correct decimals.
+ */
+function applyEVMOnChainData(pair, onChain) {
+  if (!onChain) return pair;
+  const { token0, token1, decimals0, decimals1 } = onChain;
+
+  const gtBase  = (pair.base_token?.address  || '').trim().toLowerCase();
+  const gtQuote = (pair.quote_token?.address || '').trim().toLowerCase();
+
+  const gtBaseIsToken0  = gtBase  === token0;
+  const gtBaseIsToken1  = gtBase  === token1;
+  const gtQuoteIsToken0 = gtQuote === token0;
+  const gtQuoteIsToken1 = gtQuote === token1;
+
+  if (gtBaseIsToken0 && gtQuoteIsToken1) {
+    // Order confirmed — update decimals only
+    const updated = { ...pair };
+    if (decimals0 !== null && decimals0 !== undefined) {
+      updated.base_token = { ...updated.base_token, decimals: decimals0 };
+      updated.base_token_decimals = decimals0;
+    }
+    if (decimals1 !== null && decimals1 !== undefined) {
+      updated.quote_token = { ...updated.quote_token, decimals: decimals1 };
+      updated.quote_token_decimals = decimals1;
+    }
+    console.log(`[evm-on-chain] ✓ ${pair.id} order confirmed token0=base`);
+    return updated;
+
+  } else if (gtBaseIsToken1 && gtQuoteIsToken0) {
+    // GeckoTerminal has them SWAPPED — flip base/quote
+    const updated = { ...pair };
+    const origBase  = { ...pair.base_token };
+    const origQuote = { ...pair.quote_token };
+    updated.base_token  = { ...origQuote, decimals: decimals0 ?? origQuote.decimals };
+    updated.quote_token = { ...origBase,  decimals: decimals1 ?? origBase.decimals };
+    updated.base_symbol  = updated.base_token.symbol;
+    updated.quote_symbol = updated.quote_token.symbol;
+    updated.base_token_decimals  = updated.base_token.decimals;
+    updated.quote_token_decimals = updated.quote_token.decimals;
+    updated.pool_name = `${updated.base_symbol}/${updated.quote_symbol}`;
+    console.log(`[evm-on-chain] ⚠ ${pair.id} SWAPPED GT order: ${origBase.symbol}→quote, ${origQuote.symbol}→base`);
+    return updated;
+
+  } else {
+    // GT addresses don't match either on-chain token — override addresses
+    // but keep GT symbols/logos since those are usually correct.
+    console.warn(`[evm-on-chain] ⚠ ${pair.id} GT addresses mismatch — overriding: base=${token0.slice(0,10)} quote=${token1.slice(0,10)}`);
+    const updated = { ...pair };
+    updated.base_token  = { ...updated.base_token,  address: token0, decimals: decimals0 ?? updated.base_token.decimals };
+    updated.quote_token = { ...updated.quote_token, address: token1, decimals: decimals1 ?? updated.quote_token.decimals };
+    updated.base_token_decimals  = updated.base_token.decimals;
+    updated.quote_token_decimals = updated.quote_token.decimals;
+    return updated;
+  }
+}
+// ─── End EVM On-Chain Verification ───────────────────────────────────────────
+
 const syncTrendingPairs = async () => {
   console.log('Starting GeckoTerminal sync...');
   let totalSynced = 0;
@@ -755,10 +907,11 @@ const syncTrendingPairs = async () => {
         });
       }
 
-      // ── On-Chain Verification for Solana pools ───────────────────────────
-      // Batch-fetch pool accounts via getMultipleAccounts, parse raw bytes to
-      // get the true mint0/mint1 order and on-chain decimals. GeckoTerminal's
-      // token ordering is untrusted — only used for address, symbol, logo.
+      // ── On-Chain Verification ────────────────────────────────────────────
+      // Solana: batch getMultipleAccounts to get true mint0/mint1 order.
+      // EVM (Base/BSC): call token0()/token1() on each pool contract.
+      // GeckoTerminal's token ordering is never trusted — only addresses,
+      // symbols, and logos come from GT.
       let verifiedPairs = rawPairs;
       if (network === 'solana' && rawPairs.length > 0) {
         const solanaAddresses = rawPairs.map(p => p.pool_address);
@@ -769,6 +922,16 @@ const syncTrendingPairs = async () => {
             return resolved ? applyOnChainData(pair, resolved) : pair;
           });
           console.log(`[on-chain] Applied verified data to ${onChainData.size}/${rawPairs.length} Solana pools`);
+        }
+      } else if ((network === 'base' || network === 'bsc') && rawPairs.length > 0) {
+        const evmAddresses = rawPairs.map(p => p.pool_address);
+        const evmOnChainData = await resolveEVMPoolsOnChain(network, evmAddresses);
+        if (evmOnChainData.size > 0) {
+          verifiedPairs = rawPairs.map(pair => {
+            const resolved = evmOnChainData.get(pair.pool_address.toLowerCase());
+            return resolved ? applyEVMOnChainData(pair, resolved) : pair;
+          });
+          console.log(`[evm-on-chain] Applied verified data to ${evmOnChainData.size}/${rawPairs.length} ${network} pools`);
         }
       }
 

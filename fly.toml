@@ -1,13 +1,13 @@
-# fly.toml — ubt-pair-indexer
+# fly.toml — ubtpairindexer
 # Pair indexer: polls GeckoTerminal and writes pairs to PostgreSQL.
 #
 # Deploy:
-#   fly secrets set DATABASE_URL="postgres://fly-user:PASS@pgbouncer.HOST.flympg.net/fly-db?sslmode=disable" --app ubt-pair-indexer
-#   fly deploy --app ubt-pair-indexer
+#   fly secrets set DATABASE_URL="postgres://fly-user:PASS@pgbouncer.HOST.flympg.net/fly-db?sslmode=disable" --app ubtpairindexer
+#   fly deploy --app ubtpairindexer
 #
 # DATABASE_URL is required — set it as a secret, never hardcode here.
 
-app            = "ubt-pair-indexer"
+app            = "ubtpairindexer"
 primary_region = "sin"
 
 [build]
@@ -26,7 +26,7 @@ primary_region = "sin"
   SOLANA_RPC_ENDPOINT     = "https://api.mainnet-beta.solana.com"
 
 # DATABASE_URL secret:
-#   fly secrets set DATABASE_URL="postgresql://fly-user:PASSWORD@pgbouncer.3x9jv024zzdr6qp7.flympg.net/fly-db?sslmode=disable" --app ubt-pair-indexer
+#   fly secrets set DATABASE_URL="postgresql://fly-user:PASSWORD@pgbouncer.3x9jv024zzdr6qp7.flympg.net/fly-db?sslmode=disable" --app ubtpairindexer
 
 [[services]]
   internal_port = 3001
